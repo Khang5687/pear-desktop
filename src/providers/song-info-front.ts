@@ -227,13 +227,14 @@ export const setupSongInfo = (api: MusicPlayer) => {
   });
 
   const playPausedHandler = (e: Event, status: string) => {
-    if (
-      e.target instanceof HTMLVideoElement &&
-      Math.round(e.target.currentTime) > 0
-    ) {
+    if (e.target instanceof HTMLVideoElement) {
+      const elapsedSeconds = Number.isFinite(e.target.currentTime)
+        ? Math.max(0, Math.floor(e.target.currentTime))
+        : 0;
+
       window.ipcRenderer.send('peard:play-or-paused', {
         isPaused: status === 'pause',
-        elapsedSeconds: Math.floor(e.target.currentTime),
+        elapsedSeconds,
       });
     }
   };

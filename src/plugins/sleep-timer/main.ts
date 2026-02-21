@@ -45,7 +45,13 @@ export const backend = createBackend<
       }
 
       service
-        .onSongEvent(songInfo.videoId, event === SongInfoEvent.VideoSrcChanged)
+        .onSongEvent(
+          songInfo.videoId,
+          event === SongInfoEvent.VideoSrcChanged,
+          songInfo.elapsedSeconds,
+          songInfo.songDuration,
+          songInfo.isPaused,
+        )
         .catch((error) => {
           console.error(error);
         });
@@ -67,6 +73,8 @@ export const backend = createBackend<
       }
 
       ctx.ipc.send('peard:setup-volume-changed-listener');
+      ctx.ipc.send('peard:setup-time-changed-listener');
+      ctx.ipc.send('peard:setup-seeked-listener');
       service.onPlayerApiReady();
     });
 

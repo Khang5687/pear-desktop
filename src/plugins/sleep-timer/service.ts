@@ -1,9 +1,16 @@
+import { Mutex } from 'async-mutex';
+
 import type { SleepTimerPluginConfig, SleepTimerSnapshot } from './types';
 
 const MINUTE_MS = 60_000;
 const CHANGE_TICK_MS = 30_000;
 const MAX_TIMEOUT_MS = 2_147_000_000;
 const FADE_STEP_MS = 200;
+const SONG_ROLLOVER_END_THRESHOLD_SECONDS = 2;
+const SONG_ROLLOVER_START_THRESHOLD_SECONDS = 2;
+const SONG_PROGRESS_PLAYING_EPSILON_SECONDS = 0.4;
+const SONG_END_PAUSED_EXPIRY_EPSILON_MS = 1_500;
+const SONG_END_FAIL_SAFE_GRACE_MS = 1_500;
 
 export const MIN_FADE_OUT_DURATION_SECONDS = 3;
 export const MAX_FADE_OUT_DURATION_SECONDS = 120;
@@ -41,8 +48,12 @@ export class SleepTimerService {
   private expiring = false;
   private fadeRestoreVolume: number | null = null;
   private fadeState: { startAtMs: number; durationMs: number } | null = null;
+  private songEndFailSafeTimeout: NodeJS.Timeout | null = null;
   private currentVideoId: string | null = null;
-  private songModeLastCountedVideoId: string | null = null;
+  private currentSongDurationSeconds: number | null = null;
+  private currentSongElapsedSeconds: number | null = null;
+  private isPlaybackPaused = false;
+  private readonly stateMutex = new Mutex();
 
   constructor({
     initialConfig,
@@ -59,16 +70,12 @@ export class SleepTimerService {
   }
 
   async applyConfig(newConfig: SleepTimerPluginConfig) {
-    this.config = this.normalizeConfig(newConfig);
+    await this.runWithLock(async () => {
+      this.config = this.normalizeConfig(newConfig);
 
-    if (this.config.timer.mode !== 'songs-running') {
-      this.songModeLastCountedVideoId = null;
-    } else if (!this.songModeLastCountedVideoId) {
-      this.songModeLastCountedVideoId = this.currentVideoId;
-    }
-
-    await this.reconcileTimers();
-    this.emitChange();
+      await this.reconcileTimers();
+      this.emitChange();
+    });
   }
 
   getSnapshot(now = Date.now()): SleepTimerSnapshot {
@@ -82,60 +89,66 @@ export class SleepTimerService {
   }
 
   async start(minutes: number) {
-    const safeMinutes = Math.max(1, Math.round(minutes));
-    const durationMs = safeMinutes * MINUTE_MS;
-    const endAtMs = Date.now() + durationMs;
+    await this.runWithLock(async () => {
+      const safeMinutes = Math.max(1, Math.round(minutes));
+      const durationMs = safeMinutes * MINUTE_MS;
+      const endAtMs = Date.now() + durationMs;
 
-    this.songModeLastCountedVideoId = null;
-    this.stopFadeAndRestore();
+      this.clearSongEndFailSafeTimeout();
+      this.stopFadeAndRestore();
 
-    await this.persistConfig({
-      timer: {
-        mode: 'time-running',
-        endAtMs,
-      },
-      lastSetMinutes: safeMinutes,
+      await this.persistConfig({
+        timer: {
+          mode: 'time-running',
+          endAtMs,
+        },
+        lastSetMinutes: safeMinutes,
+      });
+
+      await this.reconcileTimers();
+      this.emitChange();
     });
-
-    await this.reconcileTimers();
-    this.emitChange();
   }
 
   async startBySongs(nextSongCount: number) {
-    const safeNextSongCount = Math.max(0, Math.round(nextSongCount));
-    const internalSongCount = safeNextSongCount + 1;
+    await this.runWithLock(async () => {
+      const safeNextSongCount = Math.max(0, Math.round(nextSongCount));
+      const internalSongCount = safeNextSongCount + 1;
 
-    this.stopFadeAndRestore();
-    this.songModeLastCountedVideoId = this.currentVideoId;
+      this.clearSongEndFailSafeTimeout();
+      this.stopFadeAndRestore();
 
-    await this.persistConfig({
-      timer: {
-        mode: 'songs-running',
-        remainingSongs: internalSongCount,
-      },
-      lastSetSongs: Math.max(1, safeNextSongCount),
+      await this.persistConfig({
+        timer: {
+          mode: 'songs-running',
+          remainingSongs: internalSongCount,
+        },
+        lastSetSongs: Math.max(1, safeNextSongCount),
+      });
+
+      await this.reconcileTimers();
+      this.emitChange();
     });
-
-    await this.reconcileTimers();
-    this.emitChange();
   }
 
   async stop() {
-    if (this.config.timer.mode === 'off') {
-      return;
-    }
+    await this.runWithLock(async () => {
+      if (this.config.timer.mode === 'off') {
+        return;
+      }
 
-    this.songModeLastCountedVideoId = null;
-    this.stopFadeAndRestore();
+      this.clearSongEndFailSafeTimeout();
+      this.stopFadeAndRestore();
 
-    await this.persistConfig({
-      timer: {
-        mode: 'off',
-      },
+      await this.persistConfig({
+        timer: {
+          mode: 'off',
+        },
+      });
+
+      await this.reconcileTimers();
+      this.emitChange();
     });
-
-    await this.reconcileTimers();
-    this.emitChange();
   }
 
   onSuspend() {
@@ -143,92 +156,142 @@ export class SleepTimerService {
   }
 
   async onResume() {
-    await this.reconcileTimers();
-    this.emitChange();
+    await this.runWithLock(async () => {
+      await this.reconcileTimers();
+      this.emitChange();
+    });
   }
 
   async setPlaybackPaused(isPaused: boolean) {
-    if (!this.config.pauseWhenPlaybackPaused) {
-      return;
-    }
-
-    if (isPaused && this.config.timer.mode === 'time-running') {
-      const remainingMs = this.getRemainingMs(Date.now());
-      if (remainingMs === null) {
+    await this.runWithLock(async () => {
+      if (!this.config.pauseWhenPlaybackPaused) {
         return;
       }
 
-      if (remainingMs <= 0) {
-        await this.expireTimer('time');
+      if (isPaused && this.config.timer.mode === 'time-running') {
+        const remainingMs = this.getRemainingMs(Date.now());
+        if (remainingMs === null) {
+          return;
+        }
+
+        if (remainingMs <= 0) {
+          await this.expireTimer('time');
+          return;
+        }
+
+        await this.persistConfig({
+          timer: {
+            mode: 'time-paused',
+            remainingMs,
+          },
+        });
+        await this.reconcileTimers();
+        this.emitChange();
         return;
       }
 
-      await this.persistConfig({
-        timer: {
-          mode: 'time-paused',
-          remainingMs,
-        },
-      });
-      await this.reconcileTimers();
-      this.emitChange();
-      return;
-    }
+      if (!isPaused && this.config.timer.mode === 'time-paused') {
+        const remainingMs = Math.max(0, this.config.timer.remainingMs);
+        if (remainingMs <= 0) {
+          await this.expireTimer('time');
+          return;
+        }
 
-    if (!isPaused && this.config.timer.mode === 'time-paused') {
-      const remainingMs = Math.max(0, this.config.timer.remainingMs);
-      if (remainingMs <= 0) {
-        await this.expireTimer('time');
-        return;
+        await this.persistConfig({
+          timer: {
+            mode: 'time-running',
+            endAtMs: Date.now() + remainingMs,
+          },
+        });
+
+        await this.reconcileTimers();
+        this.emitChange();
       }
-
-      await this.persistConfig({
-        timer: {
-          mode: 'time-running',
-          endAtMs: Date.now() + remainingMs,
-        },
-      });
-
-      await this.reconcileTimers();
-      this.emitChange();
-    }
+    });
   }
 
-  async onSongEvent(videoId: string | undefined, isTrackChange: boolean) {
-    if (!videoId) {
-      return;
-    }
+  async onSongEvent(
+    videoId: string | undefined,
+    isTrackChange: boolean,
+    elapsedSeconds?: number,
+    songDurationSeconds?: number,
+    isPaused?: boolean,
+  ) {
+    await this.runWithLock(async () => {
+      if (!videoId) {
+        return;
+      }
 
-    this.currentVideoId = videoId;
+      const previousVideoId = this.currentVideoId;
+      const previousSongDurationSeconds = this.currentSongDurationSeconds;
+      const previousSongElapsedSeconds = this.currentSongElapsedSeconds;
 
-    if (this.config.timer.mode !== 'songs-running') {
-      return;
-    }
+      this.currentVideoId = videoId;
+      if (
+        typeof songDurationSeconds === 'number' &&
+        Number.isFinite(songDurationSeconds)
+      ) {
+        this.currentSongDurationSeconds = Math.max(0, songDurationSeconds);
+      }
+      if (
+        typeof elapsedSeconds === 'number' &&
+        Number.isFinite(elapsedSeconds)
+      ) {
+        this.currentSongElapsedSeconds = Math.max(0, elapsedSeconds);
+      }
+      if (typeof isPaused === 'boolean') {
+        this.isPlaybackPaused = isPaused;
+      }
 
-    if (!this.songModeLastCountedVideoId) {
-      this.songModeLastCountedVideoId = videoId;
-      return;
-    }
+      if (
+        typeof elapsedSeconds === 'number' &&
+        Number.isFinite(elapsedSeconds) &&
+        typeof previousSongElapsedSeconds === 'number' &&
+        typeof isPaused !== 'boolean' &&
+        elapsedSeconds >
+          previousSongElapsedSeconds + SONG_PROGRESS_PLAYING_EPSILON_SECONDS
+      ) {
+        this.isPlaybackPaused = false;
+      }
 
-    if (!isTrackChange) {
-      return;
-    }
+      if (this.config.timer.mode !== 'songs-running') {
+        return;
+      }
 
-    this.songModeLastCountedVideoId = videoId;
+      if (isTrackChange) {
+        this.isPlaybackPaused = false;
 
-    const remainingSongs = this.config.timer.remainingSongs - 1;
-    if (remainingSongs <= 0) {
-      await this.expireTimer('songs');
-      return;
-    }
+        const hasVideoBoundary =
+          previousVideoId !== null && previousVideoId !== videoId;
+        if (hasVideoBoundary) {
+          await this.consumeSongBoundary();
+        } else {
+          await this.syncSongModeProgressTimers();
+        }
 
-    await this.persistConfig({
-      timer: {
-        mode: 'songs-running',
-        remainingSongs,
-      },
+        return;
+      }
+
+      const hasRolloverBoundary =
+        previousVideoId === videoId &&
+        typeof previousSongDurationSeconds === 'number' &&
+        typeof previousSongElapsedSeconds === 'number' &&
+        typeof this.currentSongElapsedSeconds === 'number' &&
+        previousSongDurationSeconds - previousSongElapsedSeconds <=
+          SONG_ROLLOVER_END_THRESHOLD_SECONDS &&
+        this.currentSongElapsedSeconds <=
+          SONG_ROLLOVER_START_THRESHOLD_SECONDS &&
+        this.currentSongElapsedSeconds <
+          previousSongElapsedSeconds - SONG_PROGRESS_PLAYING_EPSILON_SECONDS;
+
+      if (hasRolloverBoundary) {
+        this.isPlaybackPaused = false;
+        await this.consumeSongBoundary();
+        return;
+      }
+
+      await this.syncSongModeProgressTimers();
     });
-
-    this.emitChange();
   }
 
   onPlayerApiReady() {
@@ -251,6 +314,7 @@ export class SleepTimerService {
   destroy() {
     this.clearExpiryTimeout();
     this.clearChangeTicker();
+    this.clearSongEndFailSafeTimeout();
     this.stopFadeAndRestore();
     this.changeCallbacks.clear();
   }
@@ -287,13 +351,9 @@ export class SleepTimerService {
     this.stopFadeAndRestore();
 
     if (this.config.timer.mode === 'songs-running') {
-      if (!this.songModeLastCountedVideoId) {
-        this.songModeLastCountedVideoId = this.currentVideoId;
-      }
+      await this.syncSongModeProgressTimers();
       return;
     }
-
-    this.songModeLastCountedVideoId = null;
   }
 
   private getRemainingMs(now: number) {
@@ -312,7 +372,7 @@ export class SleepTimerService {
   private scheduleExpiryTimeout(delayMs: number) {
     this.expiryTimeout = setTimeout(
       () => {
-        this.handleExpiryTimeout().catch((error) => {
+        this.runWithLock(() => this.handleExpiryTimeout()).catch((error) => {
           console.error(error);
         });
       },
@@ -323,7 +383,9 @@ export class SleepTimerService {
   private scheduleFadeStartTimeout(delayMs: number) {
     this.fadeStartTimeout = setTimeout(
       () => {
-        this.handleFadeStartTimeout();
+        this.runWithLock(() => this.handleFadeStartTimeout()).catch((error) => {
+          console.error(error);
+        });
       },
       Math.min(delayMs, MAX_TIMEOUT_MS),
     );
@@ -331,6 +393,9 @@ export class SleepTimerService {
 
   private async handleExpiryTimeout() {
     if (this.config.timer.mode !== 'time-running') {
+      if (this.config.timer.mode === 'songs-running') {
+        await this.syncSongModeProgressTimers();
+      }
       return;
     }
 
@@ -348,11 +413,17 @@ export class SleepTimerService {
     this.emitChange();
   }
 
-  private handleFadeStartTimeout() {
-    if (
-      this.config.timer.mode !== 'time-running' ||
-      !this.config.fadeOut.enabled
-    ) {
+  private async handleFadeStartTimeout() {
+    if (!this.config.fadeOut.enabled) {
+      return;
+    }
+
+    if (this.config.timer.mode === 'songs-running') {
+      await this.syncSongModeProgressTimers();
+      return;
+    }
+
+    if (this.config.timer.mode !== 'time-running') {
       return;
     }
 
@@ -401,7 +472,7 @@ export class SleepTimerService {
         this.setVolume(this.fadeRestoreVolume);
       }
 
-      this.songModeLastCountedVideoId = null;
+      this.clearSongEndFailSafeTimeout();
 
       await this.persistConfig({
         timer: {
@@ -476,6 +547,13 @@ export class SleepTimerService {
     if (progress >= 1) {
       this.clearFadeStepInterval();
       this.fadeState = null;
+
+      if (
+        this.config.timer.mode === 'songs-running' &&
+        this.config.timer.remainingSongs <= 1
+      ) {
+        this.scheduleSongEndFailSafeTimeout();
+      }
     }
   }
 
@@ -576,6 +654,31 @@ export class SleepTimerService {
     this.fadeStepInterval = null;
   }
 
+  private clearSongEndFailSafeTimeout() {
+    if (!this.songEndFailSafeTimeout) {
+      return;
+    }
+
+    clearTimeout(this.songEndFailSafeTimeout);
+    this.songEndFailSafeTimeout = null;
+  }
+
+  private scheduleSongEndFailSafeTimeout() {
+    this.clearSongEndFailSafeTimeout();
+    this.songEndFailSafeTimeout = setTimeout(() => {
+      this.runWithLock(async () => {
+        if (
+          this.config.timer.mode === 'songs-running' &&
+          this.config.timer.remainingSongs <= 1
+        ) {
+          await this.expireTimer('songs');
+        }
+      }).catch((error) => {
+        console.error(error);
+      });
+    }, SONG_END_FAIL_SAFE_GRACE_MS);
+  }
+
   private getFadeDurationMs() {
     const normalizedSeconds = this.normalizeFadeDurationSeconds(
       this.config.fadeOut.durationSeconds,
@@ -672,5 +775,101 @@ export class SleepTimerService {
     for (const callback of this.changeCallbacks) {
       callback();
     }
+  }
+
+  private getSongRemainingMs() {
+    if (
+      this.currentSongDurationSeconds === null ||
+      this.currentSongElapsedSeconds === null
+    ) {
+      return null;
+    }
+
+    const remainingSeconds =
+      this.currentSongDurationSeconds - this.currentSongElapsedSeconds;
+    if (!Number.isFinite(remainingSeconds)) {
+      return null;
+    }
+
+    return Math.max(0, Math.ceil(remainingSeconds * 1000));
+  }
+
+  private async syncSongModeProgressTimers() {
+    this.clearExpiryTimeout();
+    this.clearFadeStartTimeout();
+
+    if (this.config.timer.mode !== 'songs-running') {
+      return;
+    }
+
+    if (this.config.timer.remainingSongs > 1) {
+      this.clearSongEndFailSafeTimeout();
+      this.stopFadeAndRestore();
+      return;
+    }
+
+    const remainingMs = this.getSongRemainingMs();
+    if (remainingMs === null) {
+      return;
+    }
+
+    if (this.isPlaybackPaused) {
+      if (remainingMs <= SONG_END_PAUSED_EXPIRY_EPSILON_MS) {
+        await this.expireTimer('songs');
+        return;
+      }
+
+      this.stopFadeAndRestore();
+      return;
+    }
+
+    if (remainingMs <= 0) {
+      await this.expireTimer('songs');
+      return;
+    }
+
+    if (!this.config.fadeOut.enabled) {
+      this.clearSongEndFailSafeTimeout();
+      this.stopFadeAndRestore();
+      this.scheduleExpiryTimeout(remainingMs);
+      return;
+    }
+
+    const fadeDurationMs = this.getFadeDurationMs();
+    if (remainingMs <= fadeDurationMs) {
+      this.startFade(remainingMs);
+      this.scheduleExpiryTimeout(remainingMs);
+      return;
+    }
+
+    this.stopFadeAndRestore();
+    this.scheduleFadeStartTimeout(remainingMs - fadeDurationMs);
+    this.scheduleExpiryTimeout(remainingMs);
+  }
+
+  private async consumeSongBoundary() {
+    if (this.config.timer.mode !== 'songs-running') {
+      return;
+    }
+
+    const remainingSongs = this.config.timer.remainingSongs - 1;
+    if (remainingSongs <= 0) {
+      await this.expireTimer('songs');
+      return;
+    }
+
+    await this.persistConfig({
+      timer: {
+        mode: 'songs-running',
+        remainingSongs,
+      },
+    });
+
+    await this.reconcileTimers();
+    this.emitChange();
+  }
+
+  private async runWithLock<T>(fn: () => Promise<T> | T) {
+    return this.stateMutex.runExclusive(async () => fn());
   }
 }

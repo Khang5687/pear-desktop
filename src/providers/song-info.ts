@@ -252,6 +252,24 @@ const registerProvider = (win: BrowserWindow) => {
       }
     }
   });
+
+  ipcMain.on('peard:seeked', async (_, seconds: number) => {
+    const tempSongInfo = await dataMutex.runExclusive<SongInfo | null>(() => {
+      if (!songInfo) {
+        return null;
+      }
+
+      songInfo.elapsedSeconds = seconds;
+
+      return songInfo;
+    });
+
+    if (tempSongInfo) {
+      for (const c of callbacks) {
+        c(tempSongInfo, SongInfoEvent.TimeChanged);
+      }
+    }
+  });
 };
 
 const suffixesToRemove = [
