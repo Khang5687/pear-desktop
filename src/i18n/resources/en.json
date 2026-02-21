@@ -804,6 +804,76 @@
         }
       }
     },
+    "sleep-timer": {
+      "description": "Stop playback after a countdown timer ends",
+      "name": "Sleep Timer",
+      "menu": {
+        "status": {
+          "off": "Timer: Off",
+          "running": "Timer: {{minutes}}m left",
+          "paused": "Timer paused: {{minutes}}m left",
+          "songs-current": "Timer: End of current song",
+          "songs-next-song": "Timer: End of 1 next song",
+          "songs-next-songs": "Timer: End of {{songs}} songs"
+        },
+        "start-time": {
+          "label": "Start timer",
+          "minutes": "{{minutes}} minutes"
+        },
+        "start-songs": {
+          "label": "End of...",
+          "current-song": "End of current song",
+          "next-song": "End of 1 next song",
+          "next-songs": "End of {{songs}} songs"
+        },
+        "custom-minutes": {
+          "label": "Custom minutes…",
+          "prompt": {
+            "title": "Set sleep timer",
+            "label": "Enter minutes before playback is paused:"
+          }
+        },
+        "custom-songs": {
+          "label": "End of custom songs…",
+          "prompt": {
+            "title": "Set end of songs timer",
+            "label": "Enter number of next songs to play before pause:"
+          }
+        },
+        "stop": "Stop timer",
+        "advanced": {
+          "label": "Advanced",
+          "pause-when-paused": "Pause timer when playback is paused",
+          "fade-out": "Fade out before pause",
+          "fade-out-duration": {
+            "label": "Fade-out duration ({{seconds}}s)",
+            "prompt": {
+              "title": "Set fade-out duration",
+              "label": "Enter fade-out duration in seconds:"
+            }
+          }
+        }
+      },
+      "tray": {
+        "label": "Sleep Timer",
+        "enable-plugin": "Enable the Sleep Timer plugin first",
+        "status": {
+          "off": "Off",
+          "running": "{{minutes}}m left",
+          "paused": "Paused ({{minutes}}m left)",
+          "songs-current": "End of current song",
+          "songs-next-song": "End of 1 next song",
+          "songs-next-songs": "End of {{songs}} songs"
+        },
+        "start-time": {
+          "label": "Start by time"
+        },
+        "start-songs": {
+          "label": "End of..."
+        },
+        "stop": "Stop timer"
+      }
+    },
     "shortcuts": {
       "description": "Allows setting global hotkeys for playback (play/pause/next/previous) and turning off media OSD by overriding media keys, turning on Ctrl/CMD + F to search, turning on Linux MPRIS support for media keys, and custom hotkeys for advanced users",
       "menu": {

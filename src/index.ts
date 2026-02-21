@@ -35,7 +35,7 @@ import * as config from '@/config';
 import { refreshMenu, setApplicationMenu } from '@/menu';
 import { fileExists, injectCSS, injectCSSAsFile } from '@/plugins/utils/main';
 import { isTesting } from '@/utils/testing';
-import { setUpTray } from '@/tray';
+import { refreshTrayMenu, setUpTray } from '@/tray';
 import { setupSongInfo } from '@/providers/song-info';
 import { restart, setupAppControls } from '@/providers/app-controls';
 import {
@@ -242,6 +242,10 @@ const initHook = async (win: BrowserWindow) => {
         }
 
         win.webContents.send('config-changed', id, config);
+
+        if (id === 'sleep-timer') {
+          refreshTrayMenu();
+        }
       }
     });
   });
