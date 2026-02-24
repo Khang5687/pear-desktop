@@ -21,7 +21,7 @@ export const MIN_FADE_OUT_DURATION_SECONDS = 3;
 export const MAX_FADE_OUT_DURATION_SECONDS = 120;
 
 type SleepTimerPatch = Partial<Omit<SleepTimerPluginConfig, 'enabled'>>;
-type ExpireSource = 'time' | 'songs';
+type ExpireSource = 'time' | 'songs' | 'songs-boundary';
 
 interface SleepTimerServiceOptions {
   initialConfig: SleepTimerPluginConfig;
@@ -500,7 +500,7 @@ export class SleepTimerService {
     this.stopFade(false);
 
     try {
-      if (source === 'songs') {
+      if (source === 'songs' && this.shouldRunImmediateSongFade()) {
         await this.runImmediateFadeIfEnabled();
       }
 
@@ -774,12 +774,29 @@ export class SleepTimerService {
           this.config.timer.mode === 'songs-running' &&
           this.config.timer.remainingSongs <= 1
         ) {
-          await this.expireTimer('songs');
+          await this.expireTimer('songs-boundary');
         }
       }).catch((error) => {
         console.error(error);
       });
     }, SONG_END_FAIL_SAFE_GRACE_MS);
+  }
+
+  private shouldRunImmediateSongFade() {
+    if (
+      !this.config.fadeOut.enabled ||
+      this.isPlaybackPaused ||
+      this.config.timer.mode !== 'songs-running'
+    ) {
+      return false;
+    }
+
+    const remainingMs = this.getSongRemainingMs();
+    if (remainingMs === null) {
+      return false;
+    }
+
+    return remainingMs > USER_SKIP_OVERRIDE_END_GUARD_MS;
   }
 
   private isFinalSongFadeActive() {
@@ -973,10 +990,11 @@ export class SleepTimerService {
 
     if (this.isPlaybackPaused) {
       if (remainingMs <= SONG_END_PAUSED_EXPIRY_EPSILON_MS) {
-        await this.expireTimer('songs');
+        this.scheduleSongEndFailSafeTimeout();
         return;
       }
 
+      this.clearSongEndFailSafeTimeout();
       this.stopFadeAndRestore();
       return;
     }
@@ -1012,7 +1030,7 @@ export class SleepTimerService {
 
     const remainingSongs = this.config.timer.remainingSongs - 1;
     if (remainingSongs <= 0) {
-      await this.expireTimer('songs');
+      await this.expireTimer('songs-boundary');
       return;
     }
 

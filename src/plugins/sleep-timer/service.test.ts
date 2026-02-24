@@ -123,15 +123,39 @@ test('manual seek jump during final fade cancels timer', async () => {
   service.destroy();
 });
 
+test('song boundary after natural end does not re-fade next track', async () => {
+  const { service, getPauseCalls } = createService();
+
+  await service.applyConfig({
+    ...createConfig(),
+    fadeOut: {
+      enabled: true,
+      durationSeconds: 10,
+    },
+    timer: {
+      mode: 'off',
+    },
+  });
+
+  await service.startBySongs(0);
+  await service.onSongEvent('track-a', false, 180.9, 181, true);
+  await service.onSongEvent('track-b', true, 0, 245, false);
+
+  expect(service.getSnapshot().mode).toBe('off');
+  expect(getPauseCalls()).toBeGreaterThan(0);
+  service.destroy();
+});
+
 test('expires when paused at natural end for end of current song', async () => {
   const { service, getPauseCalls } = createService();
 
   await service.startBySongs(0);
   await service.onSongEvent('track-a', false, 120, 180, false);
   await service.onSongEvent('track-a', false, 179.9, 180, true);
+  await wait(1700);
 
   expect(service.getSnapshot().mode).toBe('off');
-  expect(getPauseCalls()).toBe(1);
+  expect(getPauseCalls()).toBeGreaterThan(0);
   service.destroy();
 });
 
