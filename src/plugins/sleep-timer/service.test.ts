@@ -77,6 +77,52 @@ test('keeps pause enforcement after timer turns off from expiry', async () => {
   service.destroy();
 });
 
+test('manual skip during final fade cancels timer', async () => {
+  const { service, getPauseCalls } = createService();
+
+  await service.applyConfig({
+    ...createConfig(),
+    fadeOut: {
+      enabled: true,
+      durationSeconds: 10,
+    },
+    timer: {
+      mode: 'off',
+    },
+  });
+
+  await service.startBySongs(0);
+  await service.onSongEvent('track-a', false, 158, 160, false);
+  await service.onSongEvent('track-b', true, 0, 200, false);
+
+  expect(service.getSnapshot().mode).toBe('off');
+  expect(getPauseCalls()).toBe(0);
+  service.destroy();
+});
+
+test('manual seek jump during final fade cancels timer', async () => {
+  const { service, getPauseCalls } = createService();
+
+  await service.applyConfig({
+    ...createConfig(),
+    fadeOut: {
+      enabled: true,
+      durationSeconds: 10,
+    },
+    timer: {
+      mode: 'off',
+    },
+  });
+
+  await service.startBySongs(0);
+  await service.onSongEvent('track-a', false, 158, 160, false);
+  await service.onSongEvent('track-a', false, 130, 160, false);
+
+  expect(service.getSnapshot().mode).toBe('off');
+  expect(getPauseCalls()).toBe(0);
+  service.destroy();
+});
+
 test('expires when paused at natural end for end of current song', async () => {
   const { service, getPauseCalls } = createService();
 

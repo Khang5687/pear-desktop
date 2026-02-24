@@ -14,6 +14,8 @@ const SONG_END_FAIL_SAFE_GRACE_MS = 1_500;
 const PAUSE_ENFORCEMENT_WINDOW_MS = 3_000;
 const PAUSE_ENFORCEMENT_THROTTLE_MS = 300;
 const PAUSE_ENFORCEMENT_RETRY_DELAYS_MS = [200, 600, 1_200, 2_000] as const;
+const USER_SKIP_OVERRIDE_END_GUARD_MS = 900;
+const USER_SEEK_OVERRIDE_JUMP_SECONDS = 5;
 
 export const MIN_FADE_OUT_DURATION_SECONDS = 3;
 export const MAX_FADE_OUT_DURATION_SECONDS = 120;
@@ -273,6 +275,26 @@ export class SleepTimerService {
 
         const hasVideoBoundary =
           previousVideoId !== null && previousVideoId !== videoId;
+        const previousRemainingMs =
+          typeof previousSongDurationSeconds === 'number' &&
+          typeof previousSongElapsedSeconds === 'number'
+            ? Math.max(
+                0,
+                Math.ceil(
+                  (previousSongDurationSeconds - previousSongElapsedSeconds) *
+                    1000,
+                ),
+              )
+            : null;
+
+        if (
+          hasVideoBoundary &&
+          this.shouldCancelForManualSkip(previousRemainingMs)
+        ) {
+          await this.cancelTimerForUserOverride();
+          return;
+        }
+
         if (hasVideoBoundary) {
           await this.consumeSongBoundary();
         } else {
@@ -297,6 +319,16 @@ export class SleepTimerService {
       if (hasRolloverBoundary) {
         this.isPlaybackPaused = false;
         await this.consumeSongBoundary();
+        return;
+      }
+
+      if (
+        this.shouldCancelForManualSeek(
+          previousSongElapsedSeconds,
+          this.currentSongElapsedSeconds,
+        )
+      ) {
+        await this.cancelTimerForUserOverride();
         return;
       }
 
@@ -748,6 +780,61 @@ export class SleepTimerService {
         console.error(error);
       });
     }, SONG_END_FAIL_SAFE_GRACE_MS);
+  }
+
+  private isFinalSongFadeActive() {
+    return (
+      this.fadeState !== null &&
+      this.config.timer.mode === 'songs-running' &&
+      this.config.timer.remainingSongs <= 1
+    );
+  }
+
+  private shouldCancelForManualSkip(previousRemainingMs: number | null) {
+    return (
+      this.isFinalSongFadeActive() &&
+      previousRemainingMs !== null &&
+      previousRemainingMs > USER_SKIP_OVERRIDE_END_GUARD_MS
+    );
+  }
+
+  private shouldCancelForManualSeek(
+    previousElapsedSeconds: number | null,
+    currentElapsedSeconds: number | null,
+  ) {
+    if (
+      !this.isFinalSongFadeActive() ||
+      previousElapsedSeconds === null ||
+      currentElapsedSeconds === null
+    ) {
+      return false;
+    }
+
+    return (
+      Math.abs(currentElapsedSeconds - previousElapsedSeconds) >=
+      USER_SEEK_OVERRIDE_JUMP_SECONDS
+    );
+  }
+
+  private async cancelTimerForUserOverride() {
+    if (this.config.timer.mode !== 'songs-running') {
+      return;
+    }
+
+    this.clearPauseEnforcement();
+    this.clearSongEndFailSafeTimeout();
+    this.clearExpiryTimeout();
+    this.clearFadeStartTimeout();
+    this.stopFadeAndRestore();
+
+    await this.persistConfig({
+      timer: {
+        mode: 'off',
+      },
+    });
+
+    await this.reconcileTimers();
+    this.emitChange();
   }
 
   private getFadeDurationMs() {
