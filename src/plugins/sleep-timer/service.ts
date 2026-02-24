@@ -11,6 +11,9 @@ const SONG_ROLLOVER_START_THRESHOLD_SECONDS = 2;
 const SONG_PROGRESS_PLAYING_EPSILON_SECONDS = 0.4;
 const SONG_END_PAUSED_EXPIRY_EPSILON_MS = 1_500;
 const SONG_END_FAIL_SAFE_GRACE_MS = 1_500;
+const PAUSE_ENFORCEMENT_WINDOW_MS = 3_000;
+const PAUSE_ENFORCEMENT_THROTTLE_MS = 300;
+const PAUSE_ENFORCEMENT_RETRY_DELAYS_MS = [200, 600, 1_200, 2_000] as const;
 
 export const MIN_FADE_OUT_DURATION_SECONDS = 3;
 export const MAX_FADE_OUT_DURATION_SECONDS = 120;
@@ -49,6 +52,9 @@ export class SleepTimerService {
   private fadeRestoreVolume: number | null = null;
   private fadeState: { startAtMs: number; durationMs: number } | null = null;
   private songEndFailSafeTimeout: NodeJS.Timeout | null = null;
+  private pauseEnforcementUntilMs = 0;
+  private pauseEnforcementTimeouts: NodeJS.Timeout[] = [];
+  private lastPauseRequestAtMs = 0;
   private currentVideoId: string | null = null;
   private currentSongDurationSeconds: number | null = null;
   private currentSongElapsedSeconds: number | null = null;
@@ -94,6 +100,7 @@ export class SleepTimerService {
       const durationMs = safeMinutes * MINUTE_MS;
       const endAtMs = Date.now() + durationMs;
 
+      this.clearPauseEnforcement();
       this.clearSongEndFailSafeTimeout();
       this.stopFadeAndRestore();
 
@@ -115,6 +122,7 @@ export class SleepTimerService {
       const safeNextSongCount = Math.max(0, Math.round(nextSongCount));
       const internalSongCount = safeNextSongCount + 1;
 
+      this.clearPauseEnforcement();
       this.clearSongEndFailSafeTimeout();
       this.stopFadeAndRestore();
 
@@ -137,6 +145,7 @@ export class SleepTimerService {
         return;
       }
 
+      this.clearPauseEnforcement();
       this.clearSongEndFailSafeTimeout();
       this.stopFadeAndRestore();
 
@@ -242,6 +251,7 @@ export class SleepTimerService {
       if (typeof isPaused === 'boolean') {
         this.isPlaybackPaused = isPaused;
       }
+      this.enforcePauseIfNeeded();
 
       if (
         typeof elapsedSeconds === 'number' &&
@@ -298,7 +308,7 @@ export class SleepTimerService {
     this.playerApiReady = true;
 
     if (this.pendingPausePlayback) {
-      this.pausePlayback();
+      this.requestPausePlayback(true);
       this.pendingPausePlayback = false;
     }
   }
@@ -314,6 +324,7 @@ export class SleepTimerService {
   destroy() {
     this.clearExpiryTimeout();
     this.clearChangeTicker();
+    this.clearPauseEnforcement();
     this.clearSongEndFailSafeTimeout();
     this.stopFadeAndRestore();
     this.changeCallbacks.clear();
@@ -461,10 +472,8 @@ export class SleepTimerService {
         await this.runImmediateFadeIfEnabled();
       }
 
-      this.pausePlayback();
-      if (!this.playerApiReady) {
-        this.pendingPausePlayback = true;
-      }
+      this.activatePauseEnforcement();
+      this.requestPausePlayback(true);
 
       if (restoreVolume !== null) {
         this.setVolume(restoreVolume);
@@ -661,6 +670,68 @@ export class SleepTimerService {
 
     clearTimeout(this.songEndFailSafeTimeout);
     this.songEndFailSafeTimeout = null;
+  }
+
+  private clearPauseEnforcement() {
+    this.pauseEnforcementUntilMs = 0;
+
+    for (const timeout of this.pauseEnforcementTimeouts) {
+      clearTimeout(timeout);
+    }
+
+    this.pauseEnforcementTimeouts = [];
+  }
+
+  private activatePauseEnforcement() {
+    this.pauseEnforcementUntilMs = Date.now() + PAUSE_ENFORCEMENT_WINDOW_MS;
+
+    for (const timeout of this.pauseEnforcementTimeouts) {
+      clearTimeout(timeout);
+    }
+
+    this.pauseEnforcementTimeouts = PAUSE_ENFORCEMENT_RETRY_DELAYS_MS.map(
+      (delayMs) =>
+        setTimeout(() => {
+          this.runWithLock(() => {
+            this.enforcePauseIfNeeded();
+          }).catch((error) => {
+            console.error(error);
+          });
+        }, delayMs),
+    );
+  }
+
+  private enforcePauseIfNeeded() {
+    if (this.pauseEnforcementUntilMs <= 0) {
+      return;
+    }
+
+    if (Date.now() >= this.pauseEnforcementUntilMs) {
+      this.clearPauseEnforcement();
+      return;
+    }
+
+    if (this.isPlaybackPaused) {
+      return;
+    }
+
+    this.requestPausePlayback();
+  }
+
+  private requestPausePlayback(force = false) {
+    const now = Date.now();
+    if (
+      !force &&
+      now - this.lastPauseRequestAtMs < PAUSE_ENFORCEMENT_THROTTLE_MS
+    ) {
+      return;
+    }
+
+    this.lastPauseRequestAtMs = now;
+    this.pausePlayback();
+    if (!this.playerApiReady) {
+      this.pendingPausePlayback = true;
+    }
   }
 
   private scheduleSongEndFailSafeTimeout() {

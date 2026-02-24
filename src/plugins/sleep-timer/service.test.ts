@@ -19,7 +19,10 @@ const createConfig = (): SleepTimerPluginConfig => ({
   lastSetSongs: 3,
 });
 
-const createService = () => {
+const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+const createService = (options?: { echoConfigOnSet?: boolean }) => {
+  const echoConfigOnSet = options?.echoConfigOnSet ?? false;
   let currentConfig = createConfig();
   let pauseCalls = 0;
   let volume = 100;
@@ -31,6 +34,12 @@ const createService = () => {
         ...currentConfig,
         ...patch,
       };
+
+      if (echoConfigOnSet) {
+        setTimeout(() => {
+          service.applyConfig(currentConfig).catch(() => undefined);
+        }, 0);
+      }
     },
     pausePlayback: () => {
       pauseCalls += 1;
@@ -47,6 +56,26 @@ const createService = () => {
     getConfig: () => currentConfig,
   };
 };
+
+test('keeps pause enforcement after timer turns off from expiry', async () => {
+  const { service, getPauseCalls } = createService({
+    echoConfigOnSet: true,
+  });
+
+  await service.startBySongs(0);
+  await service.onSongEvent('track-a', false, 180, 180, false);
+  await wait(50);
+
+  expect(service.getSnapshot().mode).toBe('off');
+  const initialPauseCalls = getPauseCalls();
+  expect(initialPauseCalls).toBeGreaterThan(0);
+
+  await service.onSongEvent('track-b', true, 0, 180, false);
+  await wait(900);
+
+  expect(getPauseCalls()).toBeGreaterThan(initialPauseCalls);
+  service.destroy();
+});
 
 test('expires when paused at natural end for end of current song', async () => {
   const { service, getPauseCalls } = createService();
